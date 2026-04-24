@@ -8,7 +8,41 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import os
 
-st.set_page_config(page_title="科大讯飞 实时策略看板", layout="wide", page_icon="📊")
+# ================== 手机适配配置 ==================
+st.set_page_config(
+    page_title="科大讯飞 实时策略看板",
+    layout="centered",   # 内容居中，限制最大宽度
+    page_icon="📊",
+    initial_sidebar_state="collapsed"
+)
+
+# 自定义 CSS：让卡片在手机上自动换行，字体稍大
+st.markdown("""
+<style>
+    /* 移动端优化 */
+    @media (max-width: 768px) {
+        .stMetric {
+            background-color: #f0f2f6;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px 0;
+        }
+        .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
+            font-size: 1.2rem !important;
+        }
+        .stButton button {
+            width: 100%;
+        }
+        .stPlotlyChart {
+            margin-bottom: 20px;
+        }
+    }
+    /* 让列宽在小屏幕上自适应 */
+    div[data-testid="column"] {
+        min-width: 150px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ================== 策略参数 ==================
 SYMBOL = "002230"
@@ -24,10 +58,9 @@ ATR_PROFIT_MULT = 5
 
 DATA_FILE = "history.parquet"
 
-# ================== 分时数据获取（稳定版本：取最近480条1分钟K线，过滤今日）==================
+# ================== 分时数据获取 ==================
 @st.cache_data(ttl=30, show_spinner=False)
 def get_intraday_data():
-    """获取今日分时数据（1分钟K线），返回时间、价格、成交量列表"""
     code = f"sz{SYMBOL}"
     url = f"http://ifzq.gtimg.cn/appstock/app/kline/mkline?param={code},m1,,480"
     try:
@@ -54,15 +87,11 @@ def get_intraday_data():
                 prices = [r[1] for r in records]
                 volumes = [r[2] for r in records]
                 return times, prices, volumes
-            else:
-                print(f"分时接口返回错误: {data.get('msg')}")
-        else:
-            print(f"分时接口HTTP错误: {resp.status_code}")
     except Exception as e:
-        print(f"分时数据获取异常: {e}")
+        print(f"分时数据异常: {e}")
     return [], [], []
 
-# ================== 实时行情多源主备 ==================
+# ================== 实时行情（多源主备）==================
 def get_realtime_tencent():
     try:
         url = f"https://web.sqt.gtimg.cn/q=sz{SYMBOL}"
@@ -135,7 +164,7 @@ def get_realtime():
             continue
     return None
 
-# ================== 历史数据（baostock，本地缓存）==================
+# ================== 历史数据（baostock 本地缓存）==================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_historical():
     if os.path.exists(DATA_FILE):
@@ -217,7 +246,6 @@ def compute_indicators(df_ohlc):
     returns = close.pct_change()
     hv = returns.rolling(HV_PERIOD).std() * np.sqrt(252)
 
-    # 手动计算分位（滞后一天）
     hv_pctile = pd.Series(index=hv.index, dtype=float)
     for i in range(PERCENTILE_WINDOW, len(hv)):
         window = hv.iloc[i-PERCENTILE_WINDOW:i]
@@ -276,24 +304,24 @@ def strategy_status(current_price, indicators, entry_price=None, entry_atr=None,
             else:
                 return "持仓", "green", "持有", entry_price, entry_atr, False
 
-# ================== 页面布局 ==================
+# ================== 页面布局（移动端适配）==================
 st.title(f"📈 {STOCK_NAME} 实时策略看板")
-st.caption("数据源: 多源实时 + baostock历史 | 手动刷新页面更新数据")
+st.caption("数据源: 多源实时 + baostock历史 | 手动刷新页面")
 
-# 1. 分时图
+# 1. 分时图（高度自适应）
 times, prices, volumes = get_intraday_data()
 if times and prices:
     fig_intra = make_subplots(specs=[[{"secondary_y": True}]])
     fig_intra.add_trace(go.Scatter(x=times, y=prices, mode='lines', name='价格', line=dict(color='blue', width=1.5)), secondary_y=False)
     fig_intra.add_trace(go.Bar(x=times, y=volumes, name='成交量', marker_color='lightgreen', opacity=0.5), secondary_y=True)
-    fig_intra.update_layout(title="今日分时走势 & 成交量 (9:30-15:00)", height=450, xaxis_title="时间", hovermode='x unified')
+    fig_intra.update_layout(title="今日分时走势 & 成交量", height=350, xaxis_title="时间", hovermode='x unified', margin=dict(l=0, r=0, t=40, b=0))
     fig_intra.update_yaxes(title_text="价格 (元)", secondary_y=False)
     fig_intra.update_yaxes(title_text="成交量 (手)", secondary_y=True)
     st.plotly_chart(fig_intra, width='stretch')
 else:
     st.info("分时数据暂不可用（非交易时段或数据加载中），请稍后刷新")
 
-# 2. 实时行情卡片
+# 2. 实时行情卡片（自动换行）
 realtime = get_realtime()
 if realtime is None:
     st.error("实时数据获取失败，使用昨日收盘价作为参考")
@@ -303,7 +331,6 @@ if realtime is None:
     else:
         st.stop()
 
-# 历史数据
 hist = get_historical()
 if hist is None or hist.empty:
     st.error("历史数据获取失败，请检查网络")
@@ -314,7 +341,7 @@ if indicators is None:
     st.error("历史数据不足，无法计算指标")
     st.stop()
 
-# 策略状态
+# 策略状态（session_state）
 if 'entry_price' not in st.session_state:
     st.session_state.entry_price = None
 if 'entry_atr' not in st.session_state:
@@ -331,26 +358,22 @@ st.session_state.entry_price = new_entry
 st.session_state.entry_atr = new_atr
 st.session_state.has_reduced = new_reduced
 
-# 指标卡片
-col1, col2, col3, col4 = st.columns(4)
+# 指标卡片 - 使用多行布局（移动端自动折行）
+col1, col2 = st.columns(2)
 col1.metric("最新价", f"{realtime['price']:.2f} 元", delta=f"{realtime.get('pct_chg',0):.2f}%")
-col2.metric("MA9", f"{indicators['ma9'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma9'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
-col3.metric("MA25", f"{indicators['ma25'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma25'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
-col4.metric("MA90", f"{indicators['ma90'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma90'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
+col1.metric("MA9", f"{indicators['ma9'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma9'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
+col1.metric("MA25", f"{indicators['ma25'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma25'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
+col2.metric("MA90", f"{indicators['ma90'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma90'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
+col2.metric("HV分位", f"{indicators['hv_pctile'].iloc[-1]:.1%}")
+col2.metric(f"ATR({ATR_PERIOD})", f"{indicators['atr'].iloc[-1]:.2f}")
 
-col5, col6, col7 = st.columns(3)
-col5.metric("HV分位", f"{indicators['hv_pctile'].iloc[-1]:.1%}")
-col6.metric(f"ATR({ATR_PERIOD})", f"{indicators['atr'].iloc[-1]:.2f}")
-col7.metric("策略状态", status, delta=action, delta_color="off")
+st.info(f"**当前策略状态：{status}** – {action}")
 
-st.info(f"**当前建议：{action}**")
-st.caption(f"开仓条件：价格 > MA9 > MA25 且 价格 > MA90 | 减仓条件：HV分位 > {REDUCE_THRESHOLD*100:.0f}% | 清仓条件：死叉 或 价格跌破开仓价-{ATR_STOP_MULT}*ATR 或 涨超开仓价+{ATR_PROFIT_MULT}*ATR")
-
-# 3. 技术指标复合图（4子图）
+# 3. 技术指标复合图（4个子图，高度适当压缩）
 fig = make_subplots(
     rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
     row_heights=[0.5, 0.15, 0.15, 0.2],
-    subplot_titles=("K线图 & 均线", "HV(60) 历史波动率 (年化)", "HV分位 (250日窗口)", f"ATR({ATR_PERIOD})")
+    subplot_titles=("K线图 & 均线", "HV(60) 波动率", "HV分位 (250日)", f"ATR({ATR_PERIOD})")
 )
 fig.add_trace(go.Candlestick(x=hist.index, open=hist['open'], high=hist['high'],
                              low=hist['low'], close=hist['close'], name="K线"), row=1, col=1)
@@ -365,21 +388,18 @@ fig.add_trace(go.Scatter(x=[hist.index[-1]], y=[realtime['price']], mode='marker
 
 fig.add_trace(go.Scatter(x=indicators.index, y=indicators['hv'], mode='lines',
                          name='HV(60)', line=dict(color='purple')), row=2, col=1)
-fig.update_yaxes(title_text="年化波动率", row=2, col=1, tickformat=".0%")
-
+fig.update_yaxes(title_text="波动率", row=2, col=1, tickformat=".0%")
 fig.add_trace(go.Scatter(x=indicators.index, y=indicators['hv_pctile'], mode='lines',
                          name='HV分位', line=dict(color='orange')), row=3, col=1)
 fig.add_hline(y=REDUCE_THRESHOLD, line_dash="dash", line_color="red", row=3, col=1,
-              annotation_text=f"减仓阈值 {REDUCE_THRESHOLD*100:.0f}%")
+              annotation_text="减仓阈值")
 fig.update_yaxes(title_text="分位数", row=3, col=1, tickformat=".0%")
-
 fig.add_trace(go.Scatter(x=indicators.index, y=indicators['atr'], mode='lines',
                          name=f'ATR({ATR_PERIOD})', line=dict(color='teal')), row=4, col=1)
 fig.update_yaxes(title_text="ATR (元)", row=4, col=1)
 
-fig.update_layout(title=f"{STOCK_NAME} 技术指标与策略信号", height=1200,
+fig.update_layout(title=f"{STOCK_NAME} 技术指标", height=800, 
                   xaxis_title="日期", legend=dict(orientation="h", yanchor="bottom", y=1.02))
-fig.update_xaxes(rangeslider_visible=False)
 st.plotly_chart(fig, width='stretch')
 
-st.caption(f"实时数据时间: {realtime.get('update_time', '')} | 历史数据截止: {hist.index[-1].strftime('%Y-%m-%d')} | 手动刷新页面")
+st.caption(f"实时数据时间: {realtime.get('update_time', '')} | 历史数据截止: {hist.index[-1].strftime('%Y-%m-%d')}")
