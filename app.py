@@ -7,147 +7,161 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-# ================== 1. 页面配置与移动端样式注入 ==================
-st.set_page_config(
-    page_title="讯飞策略看板", 
-    layout="wide", 
-    initial_sidebar_state="collapsed"
-)
+# ================== 1. 核心配置 ==================
+st.set_page_config(page_title="科大讯飞策略看板", layout="wide")
 
-# 注入 CSS 优化手机端显示
-st.markdown("""
-    <style>
-    /* 移动端指标卡文字缩放 */
-    [data-testid="stMetricValue"] {
-        font-size: 1.8rem !important;
-    }
-    [data-testid="stMetricDelta"] {
-        font-size: 0.9rem !important;
-    }
-    /* 减少移动端左右留白 */
-    .block-container {
-        padding-left: 1rem !important;
-        padding-right: 1rem !important;
-        padding-top: 2rem !important;
-    }
-    /* 隐藏顶部红线和菜单以增加可视面积 */
-    #MainMenu {visibility: hidden;}
-    header {visibility: hidden;}
-    footer {visibility: hidden;}
-    </style>
-""", unsafe_allow_html=True)
+SYMBOL_NAME = "科大讯飞"
+SYMBOL_CODE = "002230" 
 
-# ================== 2. 策略参数 ==================
-SYMBOL = "002230"
-SYMBOL_BS = "sz.002230"
-STOCK_NAME = "科大讯飞"
-MA_FAST, MA_MID, MA_SLOW = 9, 25, 90
-HV_PERIOD, PERCENTILE_WINDOW = 60, 250
-REDUCE_THRESHOLD, ATR_PERIOD = 0.95, 25
+# ================== 2. 数据引擎 ==================
 
-# ================== 3. 数据处理逻辑 ==================
-@st.cache_resource
-def init_bs():
-    bs.login()
-
-def get_realtime():
-    url = f"https://web.sqt.gtimg.cn/q=sz{SYMBOL}"
+def get_sina_snapshot():
+    url = f"https://hq.sinajs.cn/list=sz{SYMBOL_CODE}"
+    headers = {"Referer": "https://finance.sina.com.cn/"}
     try:
-        r = requests.get(url, timeout=3)
-        fields = r.text.split('~')
-        if len(fields) > 34:
+        r = requests.get(url, headers=headers, timeout=5)
+        raw = r.text.split('"')[1].split(',')
+        if len(raw) > 30:
             return {
-                "price": float(fields[3]), "open": float(fields[5]),
-                "high": float(fields[33]), "low": float(fields[34]),
-                "pct_chg": float(fields[32]), "volume": float(fields[36]),
-                "update_time": datetime.now().strftime("%H:%M:%S")
+                'date': pd.to_datetime(raw[30]),
+                'open': float(raw[1]), 
+                'high': float(raw[4]),
+                'low': float(raw[5]), 
+                'close': float(raw[3])
             }
-    except: return None
+    except:
+        return None
 
-@st.cache_data(ttl=3600)
-def get_historical(): 
-    init_bs()
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=950)).strftime("%Y-%m-%d")
-    rs = bs.query_history_k_data_plus(SYMBOL_BS, "date,open,high,low,close,volume",
-                                    start_date=start, end_date=end, frequency="d", adjustflag="2")
-    data_list = []
-    while (rs.error_code == '0') and rs.next(): data_list.append(rs.get_row_data())
-    df = pd.DataFrame(data_list, columns=['date','open','high','low','close','volume'])
-    df['date'] = pd.to_datetime(df['date'])
-    df.set_index('date', inplace=True)
-    return df.astype(float).sort_index()
+def get_sina_min_line():
+    url = f"https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData?symbol=sz{SYMBOL_CODE}&scale=1&datalen=242"
+    headers = {"Referer": "https://finance.sina.com.cn/"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        text = r.text
+        start, end = text.find('['), text.rfind(']') + 1
+        if start != -1 and end != -1:
+            pure_json = text[start:end]
+            if not pure_json.endswith(']'): pure_json += ']'
+            df_min = pd.read_json(pure_json)
+            if not df_min.empty:
+                df_min['day'] = pd.to_datetime(df_min['day'])
+                last_day = df_min['day'].dt.date.max()
+                return df_min[df_min['day'].dt.date == last_day].copy()
+    except: pass
+    return pd.DataFrame()
 
-def compute_indicators(hist_df, realtime):
-    today = pd.to_datetime(datetime.now().date())
-    temp = pd.DataFrame({'open': realtime['open'], 'high': realtime['high'], 'low': realtime['low'], 
-                         'close': realtime['price'], 'volume': realtime['volume']}, index=[today])
-    df = pd.concat([hist_df[hist_df.index.date < today.date()], temp])
-    df = df[~df.index.duplicated(keep='last')].ffill()
-
-    # 核心指标
-    df['ma9'] = df['close'].rolling(MA_FAST).mean()
-    df['ma25'] = df['close'].rolling(MA_MID).mean()
-    df['ma90'] = df['close'].rolling(MA_SLOW).mean()
-    df['ma9_chg'] = df['ma9'] - df['ma9'].shift(1)
+@st.cache_data(ttl=300)
+def get_combined_data():
+    bs.login()
+    # 【修复2：数据量】拉取 730 天（2年）数据，确保 HV60 分位有足够参考系
+    start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    rs = bs.query_history_k_data_plus(f"sz.{SYMBOL_CODE}", "date,open,high,low,close",
+                                    start_date=start_date, end_date="", frequency="d", adjustflag="2")
+    data = []
+    while rs.next(): data.append(rs.get_row_data())
     
-    returns = df['close'].pct_change()
-    df['hv'] = returns.rolling(HV_PERIOD, min_periods=10).std() * np.sqrt(252)
-    df['hv_pctile'] = df['hv'].rolling(PERCENTILE_WINDOW).apply(
+    df = pd.DataFrame(data, columns=['date','open','high','low','close'])
+    df['date'] = pd.to_datetime(df['date'])
+    for col in ['open', 'high', 'low', 'close']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.set_index('date', inplace=True)
+    
+    snap = get_sina_snapshot()
+    if snap and snap['date'] not in df.index:
+        new_row = pd.DataFrame([snap]).set_index('date')
+        df = pd.concat([df, new_row])
+    
+    bs.logout()
+    return df.sort_index()
+
+# ================== 3. 指标计算 ==================
+
+def compute_indicators(df):
+    df = df.copy()
+    # 均线组
+    df['ma9'] = df['close'].rolling(9).mean()
+    df['ma25'] = df['close'].rolling(25).mean()
+    df['ma90'] = df['close'].rolling(90).mean()
+    
+    # ATR
+    pc = df['close'].shift(1)
+    tr = pd.concat([df['high']-df['low'], (df['high']-pc).abs(), (df['low']-pc).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(25).mean()
+    
+    # HV60 波动分位计算
+    log_return = np.log(df['close'] / df['close'].shift(1))
+    vol = log_return.rolling(60).std() * np.sqrt(252)
+    # 计算当前波动率在过去 250 个交易日内的排名百分比
+    df['hv_pctile'] = vol.rolling(250).apply(
         lambda x: (x[:-1] < x[-1]).mean() if not np.isnan(x[-1]) else np.nan, raw=True
     )
-    
-    tr = pd.concat([df['high']-df['low'], (df['high']-df['close'].shift(1)).abs(), (df['low']-df['close'].shift(1)).abs()], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(ATR_PERIOD, min_periods=1).mean()
     return df
 
-# ================== 4. 界面渲染 ==================
-st.subheader(f"📊 {STOCK_NAME} ({SYMBOL}) 实时看板")
+# ================== 4. 渲染 ==================
 
-hist, real = get_historical(), get_realtime()
+st.title(f"🚀 {SYMBOL_NAME} ({SYMBOL_CODE}) 完整决策看板")
 
-if hist is not None and real is not None:
-    df = compute_indicators(hist, real)
-    curr = df.iloc[-1]
+df_raw = get_combined_data()
 
-    # 看板指标 (在手机端会自动堆叠)
-    cols = st.columns(2) if st.session_state.get('mobile') else st.columns(4)
-    # 使用两行显示以适配竖屏
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
-    c1.metric("最新", f"{real['price']:.2f}", f"{real['pct_chg']}%")
-    c2.metric(f"MA{MA_FAST}", f"{curr['ma9']:.2f}", f"{curr['ma9_chg']:+.2f}")
-    c3.metric("HV分位", f"{curr['hv_pctile']:.1%}")
-    c4.metric("ATR", f"{curr['atr']:.2f}")
-
-    # 图表绘制
-    plot_df = df.dropna(subset=['hv_pctile']).tail(180)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
+if not df_raw.empty:
+    df = compute_indicators(df_raw)
+    latest = df.iloc[-1]
     
-    # 增加响应式配置
-    fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['open'], high=plot_df['high'], low=plot_df['low'], close=plot_df['close'], name="K线"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma9'], name="MA9", line=dict(color='orange', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma25'], name="MA25", line=dict(color='cyan', width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma90'], name="MA90", line=dict(color='red', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['hv_pctile'], name="HV分位", fill='tozeroy'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['atr'], name="ATR", line=dict(color='green')), row=3, col=1)
+    # 指标卡
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("最新价", f"¥{latest['close']:.2f}")
+    with c2: st.metric("MA9 (短期支撑)", f"¥{latest['ma9']:.2f}")
+    with c3: 
+        val = latest['hv_pctile']
+        st.metric("HV60 波动分位", f"{val:.1%}" if not np.isnan(val) else "计算中...")
+    with c4: st.metric("ATR 波动值", f"{latest['atr']:.2f}")
 
-    fig.update_layout(
-        height=700, 
-        margin=dict(l=10, r=10, t=20, b=20),
-        xaxis_rangeslider_visible=False,
-        autosize=True, # 关键：自适应宽度
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    # 分时图
+    df_min = get_sina_min_line()
+    if not df_min.empty:
+        fig_min = go.Figure()
+        fig_min.add_trace(go.Scatter(x=df_min['day'], y=df_min['close'], fill='tozeroy', name="分时", line=dict(color='#00d2ff')))
+        fig_min.update_layout(height=250, title="今日分时", template="plotly_white")
+        st.plotly_chart(fig_min, width='stretch')
+
+    # 主力图表
+    st.subheader("📅 深度趋势分析 (MA9/25/90 + HV60)")
+    pdf = df.tail(200) # 展示最近 200 天数据
+    
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, 
+        vertical_spacing=0.05, 
+        row_heights=[0.5, 0.25, 0.25],
+        subplot_titles=("价格与均线系统", "HV60 波动率百分位 (反映波动剧烈程度)", "ATR (真实波幅)")
     )
-    st.plotly_chart(fig, width='stretch', config={'responsive': True})
+    
+    # 1. K线与均线 (【修复1：颜色】MA9 改为醒目的紫色)
+    fig.add_trace(go.Candlestick(x=pdf.index, open=pdf.open, high=pdf.high, low=pdf.low, close=pdf.close, name="K线"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['ma9'], line=dict(color='#9400D3', width=1.5), name="MA9 (紫)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['ma25'], line=dict(color='#FFD700', width=1.5), name="MA25 (金)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['ma90'], line=dict(color='#FF4500', width=1.5), name="MA90 (红)"), row=1, col=1)
+    
+    # 2. HV60 分位面积图
+    fig.add_trace(go.Scatter(
+        x=pdf.index, y=pdf['hv_pctile'], 
+        fill='tozeroy', 
+        name="HV60分位", 
+        line=dict(color='#FF8C00', width=2),
+        fillcolor='rgba(255, 140, 0, 0.2)'
+    ), row=2, col=1)
+    # 增加参考线
+    fig.add_hline(y=0.8, line_dash="dash", line_color="red", row=2, col=1, annotation_text="高波")
+    fig.add_hline(y=0.2, line_dash="dash", line_color="green", row=2, col=1, annotation_text="低波")
 
-    # 最近10天表
-    st.markdown("##### 📋 10日关键参数")
-    recent_10 = df.tail(10)[['close', 'ma9', 'ma25', 'hv_pctile', 'atr']].copy()
-    recent_10.index = recent_10.index.strftime('%m-%d')
-    st.dataframe(recent_10.style.format({'hv_pctile': '{:.1%}', 'close': '{:.2f}', 'ma9': '{:.2f}', 'ma25': '{:.2f}', 'atr': '{:.2f}'}), width='stretch')
+    # 3. ATR
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['atr'], name="ATR", line=dict(color='#1E90FF', width=2)), row=3, col=1)
+    
+    fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
+    st.plotly_chart(fig, width='stretch')
 
-    # 底部说明
-    with st.expander("📖 策略逻辑"):
-        st.caption("均线金叉 + HV极端值风控 + ATR动态波幅止损。HV分位 > 95% 建议减仓。")
+    # 数据表格
+    st.subheader("📋 策略原始数据 (最近15日)")
+    st.dataframe(df[['close', 'ma9', 'ma25', 'hv_pctile', 'atr']].tail(15).iloc[::-1], width='stretch')
+
 else:
-    st.error("数据连接失败")
+    st.error("数据加载失败。")
