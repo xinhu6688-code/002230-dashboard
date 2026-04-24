@@ -6,400 +6,148 @@ import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-import os
 
-# ================== 手机适配配置 ==================
+# ================== 1. 页面配置与移动端样式注入 ==================
 st.set_page_config(
-    page_title="科大讯飞 实时策略看板",
-    layout="centered",   # 内容居中，限制最大宽度
-    page_icon="📊",
+    page_title="讯飞策略看板", 
+    layout="wide", 
     initial_sidebar_state="collapsed"
 )
 
-# 自定义 CSS：让卡片在手机上自动换行，字体稍大
+# 注入 CSS 优化手机端显示
 st.markdown("""
-<style>
-    /* 移动端优化 */
-    @media (max-width: 768px) {
-        .stMetric {
-            background-color: #f0f2f6;
-            border-radius: 10px;
-            padding: 10px;
-            margin: 5px 0;
-        }
-        .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
-            font-size: 1.2rem !important;
-        }
-        .stButton button {
-            width: 100%;
-        }
-        .stPlotlyChart {
-            margin-bottom: 20px;
-        }
+    <style>
+    /* 移动端指标卡文字缩放 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.8rem !important;
     }
-    /* 让列宽在小屏幕上自适应 */
-    div[data-testid="column"] {
-        min-width: 150px;
+    [data-testid="stMetricDelta"] {
+        font-size: 0.9rem !important;
     }
-</style>
+    /* 减少移动端左右留白 */
+    .block-container {
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        padding-top: 2rem !important;
+    }
+    /* 隐藏顶部红线和菜单以增加可视面积 */
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
 """, unsafe_allow_html=True)
 
-# ================== 策略参数 ==================
+# ================== 2. 策略参数 ==================
 SYMBOL = "002230"
 SYMBOL_BS = "sz.002230"
 STOCK_NAME = "科大讯飞"
-MA_FAST, MA_SLOW, TREND_MA = 9, 25, 90
-HV_PERIOD = 60
-PERCENTILE_WINDOW = 250
-REDUCE_THRESHOLD = 0.95
-ATR_PERIOD = 25
-ATR_STOP_MULT = 3
-ATR_PROFIT_MULT = 5
+MA_FAST, MA_MID, MA_SLOW = 9, 25, 90
+HV_PERIOD, PERCENTILE_WINDOW = 60, 250
+REDUCE_THRESHOLD, ATR_PERIOD = 0.95, 25
 
-DATA_FILE = "history.parquet"
-
-# ================== 分时数据获取 ==================
-@st.cache_data(ttl=30, show_spinner=False)
-def get_intraday_data():
-    code = f"sz{SYMBOL}"
-    url = f"http://ifzq.gtimg.cn/appstock/app/kline/mkline?param={code},m1,,480"
-    try:
-        resp = requests.get(url, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('code') == 0:
-                m1_list = data['data'][code]['m1']
-                if not m1_list:
-                    return [], [], []
-                today_str = datetime.now().strftime("%Y%m%d")
-                records = []
-                for item in m1_list:
-                    time_str = item[0]
-                    if not time_str.startswith(today_str):
-                        continue
-                    if len(time_str) < 12:
-                        continue
-                    hhmm = time_str[8:12]
-                    if "0930" <= hhmm <= "1500":
-                        records.append((f"{hhmm[:2]}:{hhmm[2:]}", float(item[4]), int(float(item[5]))))
-                records.sort(key=lambda x: x[0])
-                times = [r[0] for r in records]
-                prices = [r[1] for r in records]
-                volumes = [r[2] for r in records]
-                return times, prices, volumes
-    except Exception as e:
-        print(f"分时数据异常: {e}")
-    return [], [], []
-
-# ================== 实时行情（多源主备）==================
-def get_realtime_tencent():
-    try:
-        url = f"https://web.sqt.gtimg.cn/q=sz{SYMBOL}"
-        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://gu.qq.com/'}
-        r = requests.get(url, headers=headers, timeout=5)
-        r.encoding = 'gbk'
-        raw = r.text.split('=')[1].strip('";\n')
-        fields = raw.split('~')
-        if len(fields) > 3:
-            return {
-                "price": float(fields[3]),
-                "open": float(fields[5]),
-                "close_yest": float(fields[4]),
-                "pct_chg": float(fields[32]),
-                "volume": float(fields[36]) / 10000,
-                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-    except:
-        return None
-
-def get_realtime_sina():
-    try:
-        url = f"https://hq.sinajs.cn/list=sz{SYMBOL}"
-        headers = {"Referer": "https://finance.sina.com.cn"}
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.text.split(',')
-            if len(data) > 3:
-                price = float(data[3])
-                yest = float(data[2])
-                return {
-                    "price": price,
-                    "open": float(data[1]),
-                    "close_yest": yest,
-                    "pct_chg": (price / yest - 1) * 100,
-                    "volume": float(data[8]) / 10000,
-                    "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-    except:
-        return None
-
-def get_realtime_eastmoney():
-    try:
-        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid=0.{SYMBOL}&fields=f43,f44,f45,f46,f47,f48,f49"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            d = r.json().get('data', {})
-            if d:
-                price = d.get('f43', 0) / 100
-                yest = d.get('f44', 0) / 100
-                return {
-                    "price": price,
-                    "open": d.get('f46', 0) / 100,
-                    "close_yest": yest,
-                    "pct_chg": (price / yest - 1) * 100 if yest else 0,
-                    "volume": d.get('f47', 0) / 10000,
-                    "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-    except:
-        return None
+# ================== 3. 数据处理逻辑 ==================
+@st.cache_resource
+def init_bs():
+    bs.login()
 
 def get_realtime():
-    sources = [get_realtime_tencent, get_realtime_sina, get_realtime_eastmoney]
-    for src in sources:
-        try:
-            data = src()
-            if data and data.get('price', 0) > 0:
-                return data
-        except:
-            continue
-    return None
-
-# ================== 历史数据（baostock 本地缓存）==================
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_historical():
-    if os.path.exists(DATA_FILE):
-        df = pd.read_parquet(DATA_FILE)
-        last_date = df.index.max().date()
-        if last_date < datetime.now().date():
-            df = update_historical(df, last_date)
-        return df
-    else:
-        df = fetch_from_baostock()
-        if df is not None:
-            df.to_parquet(DATA_FILE)
-        return df
-
-def fetch_from_baostock(days=600):
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days+100)).strftime("%Y-%m-%d")
+    url = f"https://web.sqt.gtimg.cn/q=sz{SYMBOL}"
     try:
-        bs.login()
-        rs = bs.query_history_k_data_plus(SYMBOL_BS,
-            "date,open,high,low,close,volume",
-            start_date=start, end_date=end,
-            frequency="d", adjustflag="2")
-        records = []
-        while (rs.error_code == '0') and rs.next():
-            records.append(rs.get_row_data())
-        bs.logout()
-        if not records:
-            return None
-        df = pd.DataFrame(records, columns=['date','open','high','low','close','volume'])
-        df['date'] = pd.to_datetime(df['date'])
-        df.set_index('date', inplace=True)
-        df = df.astype(float).sort_index()
-        return df.iloc[-days:]
-    except Exception as e:
-        st.error(f"baostock 历史数据获取失败: {e}")
-        return None
+        r = requests.get(url, timeout=3)
+        fields = r.text.split('~')
+        if len(fields) > 34:
+            return {
+                "price": float(fields[3]), "open": float(fields[5]),
+                "high": float(fields[33]), "low": float(fields[34]),
+                "pct_chg": float(fields[32]), "volume": float(fields[36]),
+                "update_time": datetime.now().strftime("%H:%M:%S")
+            }
+    except: return None
 
-def update_historical(df_old, last_date):
-    start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+@st.cache_data(ttl=3600)
+def get_historical(): 
+    init_bs()
     end = datetime.now().strftime("%Y-%m-%d")
-    try:
-        bs.login()
-        rs = bs.query_history_k_data_plus(SYMBOL_BS,
-            "date,open,high,low,close,volume",
-            start_date=start, end_date=end,
-            frequency="d", adjustflag="2")
-        records = []
-        while (rs.error_code == '0') and rs.next():
-            records.append(rs.get_row_data())
-        bs.logout()
-        if records:
-            df_new = pd.DataFrame(records, columns=['date','open','high','low','close','volume'])
-            df_new['date'] = pd.to_datetime(df_new['date'])
-            df_new.set_index('date', inplace=True)
-            df_new = df_new.astype(float)
-            df = pd.concat([df_old, df_new])
-            df = df[~df.index.duplicated(keep='last')].sort_index()
-            df.to_parquet(DATA_FILE)
-            return df
-        else:
-            return df_old
-    except Exception as e:
-        st.warning(f"增量更新失败: {e}")
-        return df_old
+    start = (datetime.now() - timedelta(days=950)).strftime("%Y-%m-%d")
+    rs = bs.query_history_k_data_plus(SYMBOL_BS, "date,open,high,low,close,volume",
+                                    start_date=start, end_date=end, frequency="d", adjustflag="2")
+    data_list = []
+    while (rs.error_code == '0') and rs.next(): data_list.append(rs.get_row_data())
+    df = pd.DataFrame(data_list, columns=['date','open','high','low','close','volume'])
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    return df.astype(float).sort_index()
 
-# ================== 指标计算 ==================
-def compute_indicators(df_ohlc):
-    if df_ohlc is None or len(df_ohlc) < PERCENTILE_WINDOW:
-        return None
-    close = df_ohlc['close']
-    high = df_ohlc['high']
-    low = df_ohlc['low']
+def compute_indicators(hist_df, realtime):
+    today = pd.to_datetime(datetime.now().date())
+    temp = pd.DataFrame({'open': realtime['open'], 'high': realtime['high'], 'low': realtime['low'], 
+                         'close': realtime['price'], 'volume': realtime['volume']}, index=[today])
+    df = pd.concat([hist_df[hist_df.index.date < today.date()], temp])
+    df = df[~df.index.duplicated(keep='last')].ffill()
 
-    ma9 = close.rolling(MA_FAST).mean()
-    ma25 = close.rolling(MA_SLOW).mean()
-    ma90 = close.rolling(TREND_MA).mean()
+    # 核心指标
+    df['ma9'] = df['close'].rolling(MA_FAST).mean()
+    df['ma25'] = df['close'].rolling(MA_MID).mean()
+    df['ma90'] = df['close'].rolling(MA_SLOW).mean()
+    df['ma9_chg'] = df['ma9'] - df['ma9'].shift(1)
+    
+    returns = df['close'].pct_change()
+    df['hv'] = returns.rolling(HV_PERIOD, min_periods=10).std() * np.sqrt(252)
+    df['hv_pctile'] = df['hv'].rolling(PERCENTILE_WINDOW).apply(
+        lambda x: (x[:-1] < x[-1]).mean() if not np.isnan(x[-1]) else np.nan, raw=True
+    )
+    
+    tr = pd.concat([df['high']-df['low'], (df['high']-df['close'].shift(1)).abs(), (df['low']-df['close'].shift(1)).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(ATR_PERIOD, min_periods=1).mean()
+    return df
 
-    returns = close.pct_change()
-    hv = returns.rolling(HV_PERIOD).std() * np.sqrt(252)
+# ================== 4. 界面渲染 ==================
+st.subheader(f"📊 {STOCK_NAME} ({SYMBOL}) 实时看板")
 
-    hv_pctile = pd.Series(index=hv.index, dtype=float)
-    for i in range(PERCENTILE_WINDOW, len(hv)):
-        window = hv.iloc[i-PERCENTILE_WINDOW:i]
-        current = hv.iloc[i]
-        pct = (window < current).sum() / len(window)
-        hv_pctile.iloc[i] = pct
-    hv_pctile.iloc[:PERCENTILE_WINDOW] = 0.5
-    hv_pctile_lag = hv_pctile.shift(1)
+hist, real = get_historical(), get_realtime()
 
-    tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(ATR_PERIOD).mean()
+if hist is not None and real is not None:
+    df = compute_indicators(hist, real)
+    curr = df.iloc[-1]
 
-    return pd.DataFrame({
-        'ma9': ma9, 'ma25': ma25, 'ma90': ma90,
-        'hv': hv, 'hv_pctile': hv_pctile_lag,
-        'atr': atr
-    }, index=df_ohlc.index)
+    # 看板指标 (在手机端会自动堆叠)
+    cols = st.columns(2) if st.session_state.get('mobile') else st.columns(4)
+    # 使用两行显示以适配竖屏
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    c1.metric("最新", f"{real['price']:.2f}", f"{real['pct_chg']}%")
+    c2.metric(f"MA{MA_FAST}", f"{curr['ma9']:.2f}", f"{curr['ma9_chg']:+.2f}")
+    c3.metric("HV分位", f"{curr['hv_pctile']:.1%}")
+    c4.metric("ATR", f"{curr['atr']:.2f}")
 
-# ================== 策略状态机 ==================
-def strategy_status(current_price, indicators, entry_price=None, entry_atr=None, has_reduced=False):
-    if current_price is None or indicators is None:
-        return "数据不足", "gray", "-", None, None, False
-    ma9 = indicators['ma9'].iloc[-1]
-    ma25 = indicators['ma25'].iloc[-1]
-    ma90 = indicators['ma90'].iloc[-1]
-    hv_pct = indicators['hv_pctile'].iloc[-1]
-    atr = indicators['atr'].iloc[-1]
+    # 图表绘制
+    plot_df = df.dropna(subset=['hv_pctile']).tail(180)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
+    
+    # 增加响应式配置
+    fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['open'], high=plot_df['high'], low=plot_df['low'], close=plot_df['close'], name="K线"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma9'], name="MA9", line=dict(color='orange', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma25'], name="MA25", line=dict(color='cyan', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['ma90'], name="MA90", line=dict(color='red', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['hv_pctile'], name="HV分位", fill='tozeroy'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['atr'], name="ATR", line=dict(color='green')), row=3, col=1)
 
-    buy_signal = (current_price > ma9) and (ma9 > ma25) and (current_price > ma90)
-    reduce_signal = (entry_price is not None) and (not has_reduced) and (hv_pct > REDUCE_THRESHOLD)
-    sell_signal = False
-    if entry_price is not None and entry_atr is not None:
-        stop_price = entry_price - ATR_STOP_MULT * entry_atr
-        profit_price = entry_price + ATR_PROFIT_MULT * entry_atr
-        if current_price <= stop_price or current_price >= profit_price:
-            sell_signal = True
-    if (current_price < ma9 and ma9 < ma25):
-        sell_signal = True
+    fig.update_layout(
+        height=700, 
+        margin=dict(l=10, r=10, t=20, b=20),
+        xaxis_rangeslider_visible=False,
+        autosize=True, # 关键：自适应宽度
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig, width='stretch', config={'responsive': True})
 
-    if entry_price is None:
-        if buy_signal:
-            return "持仓", "green", f"买入 @{current_price:.2f}", current_price, atr, False
-        else:
-            return "空仓", "gray", "等待金叉", None, None, False
-    else:
-        if sell_signal:
-            return "空仓", "gray", f"清仓 @{current_price:.2f}", None, None, False
-        elif reduce_signal:
-            return "已减仓", "orange", f"减仓50% (HV分位 {hv_pct:.1%})", entry_price, entry_atr, True
-        else:
-            if has_reduced:
-                return "已减仓", "orange", "持有剩余仓位", entry_price, entry_atr, True
-            else:
-                return "持仓", "green", "持有", entry_price, entry_atr, False
+    # 最近10天表
+    st.markdown("##### 📋 10日关键参数")
+    recent_10 = df.tail(10)[['close', 'ma9', 'ma25', 'hv_pctile', 'atr']].copy()
+    recent_10.index = recent_10.index.strftime('%m-%d')
+    st.dataframe(recent_10.style.format({'hv_pctile': '{:.1%}', 'close': '{:.2f}', 'ma9': '{:.2f}', 'ma25': '{:.2f}', 'atr': '{:.2f}'}), width='stretch')
 
-# ================== 页面布局（移动端适配）==================
-st.title(f"📈 {STOCK_NAME} 实时策略看板")
-st.caption("数据源: 多源实时 + baostock历史 | 手动刷新页面")
-
-# 1. 分时图（高度自适应）
-times, prices, volumes = get_intraday_data()
-if times and prices:
-    fig_intra = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_intra.add_trace(go.Scatter(x=times, y=prices, mode='lines', name='价格', line=dict(color='blue', width=1.5)), secondary_y=False)
-    fig_intra.add_trace(go.Bar(x=times, y=volumes, name='成交量', marker_color='lightgreen', opacity=0.5), secondary_y=True)
-    fig_intra.update_layout(title="今日分时走势 & 成交量", height=350, xaxis_title="时间", hovermode='x unified', margin=dict(l=0, r=0, t=40, b=0))
-    fig_intra.update_yaxes(title_text="价格 (元)", secondary_y=False)
-    fig_intra.update_yaxes(title_text="成交量 (手)", secondary_y=True)
-    st.plotly_chart(fig_intra, width='stretch')
+    # 底部说明
+    with st.expander("📖 策略逻辑"):
+        st.caption("均线金叉 + HV极端值风控 + ATR动态波幅止损。HV分位 > 95% 建议减仓。")
 else:
-    st.info("分时数据暂不可用（非交易时段或数据加载中），请稍后刷新")
-
-# 2. 实时行情卡片（自动换行）
-realtime = get_realtime()
-if realtime is None:
-    st.error("实时数据获取失败，使用昨日收盘价作为参考")
-    hist = get_historical()
-    if hist is not None:
-        realtime = {"price": hist['close'].iloc[-1], "pct_chg": 0, "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    else:
-        st.stop()
-
-hist = get_historical()
-if hist is None or hist.empty:
-    st.error("历史数据获取失败，请检查网络")
-    st.stop()
-
-indicators = compute_indicators(hist)
-if indicators is None:
-    st.error("历史数据不足，无法计算指标")
-    st.stop()
-
-# 策略状态（session_state）
-if 'entry_price' not in st.session_state:
-    st.session_state.entry_price = None
-if 'entry_atr' not in st.session_state:
-    st.session_state.entry_atr = None
-if 'has_reduced' not in st.session_state:
-    st.session_state.has_reduced = False
-
-status, color, action, new_entry, new_atr, new_reduced = strategy_status(
-    realtime['price'], indicators,
-    st.session_state.entry_price, st.session_state.entry_atr,
-    st.session_state.has_reduced
-)
-st.session_state.entry_price = new_entry
-st.session_state.entry_atr = new_atr
-st.session_state.has_reduced = new_reduced
-
-# 指标卡片 - 使用多行布局（移动端自动折行）
-col1, col2 = st.columns(2)
-col1.metric("最新价", f"{realtime['price']:.2f} 元", delta=f"{realtime.get('pct_chg',0):.2f}%")
-col1.metric("MA9", f"{indicators['ma9'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma9'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
-col1.metric("MA25", f"{indicators['ma25'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma25'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
-col2.metric("MA90", f"{indicators['ma90'].iloc[-1]:.2f}", delta=f"{(realtime['price']/indicators['ma90'].iloc[-1]-1)*100:.2f}%", delta_color="inverse")
-col2.metric("HV分位", f"{indicators['hv_pctile'].iloc[-1]:.1%}")
-col2.metric(f"ATR({ATR_PERIOD})", f"{indicators['atr'].iloc[-1]:.2f}")
-
-st.info(f"**当前策略状态：{status}** – {action}")
-
-# 3. 技术指标复合图（4个子图，高度适当压缩）
-fig = make_subplots(
-    rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-    row_heights=[0.5, 0.15, 0.15, 0.2],
-    subplot_titles=("K线图 & 均线", "HV(60) 波动率", "HV分位 (250日)", f"ATR({ATR_PERIOD})")
-)
-fig.add_trace(go.Candlestick(x=hist.index, open=hist['open'], high=hist['high'],
-                             low=hist['low'], close=hist['close'], name="K线"), row=1, col=1)
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['ma9'], mode='lines',
-                         name=f'MA{MA_FAST}', line=dict(color='orange')), row=1, col=1)
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['ma25'], mode='lines',
-                         name=f'MA{MA_SLOW}', line=dict(color='blue')), row=1, col=1)
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['ma90'], mode='lines',
-                         name=f'MA{TREND_MA}', line=dict(color='red')), row=1, col=1)
-fig.add_trace(go.Scatter(x=[hist.index[-1]], y=[realtime['price']], mode='markers',
-                         marker=dict(color='green', size=10), name='实时价'), row=1, col=1)
-
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['hv'], mode='lines',
-                         name='HV(60)', line=dict(color='purple')), row=2, col=1)
-fig.update_yaxes(title_text="波动率", row=2, col=1, tickformat=".0%")
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['hv_pctile'], mode='lines',
-                         name='HV分位', line=dict(color='orange')), row=3, col=1)
-fig.add_hline(y=REDUCE_THRESHOLD, line_dash="dash", line_color="red", row=3, col=1,
-              annotation_text="减仓阈值")
-fig.update_yaxes(title_text="分位数", row=3, col=1, tickformat=".0%")
-fig.add_trace(go.Scatter(x=indicators.index, y=indicators['atr'], mode='lines',
-                         name=f'ATR({ATR_PERIOD})', line=dict(color='teal')), row=4, col=1)
-fig.update_yaxes(title_text="ATR (元)", row=4, col=1)
-
-fig.update_layout(title=f"{STOCK_NAME} 技术指标", height=800, 
-                  xaxis_title="日期", legend=dict(orientation="h", yanchor="bottom", y=1.02))
-st.plotly_chart(fig, width='stretch')
-
-st.caption(f"实时数据时间: {realtime.get('update_time', '')} | 历史数据截止: {hist.index[-1].strftime('%Y-%m-%d')}")
+    st.error("数据连接失败")
