@@ -53,7 +53,7 @@ def get_historical_data():
     finally:
         bs.logout()
 
-# ================== 3. 指标计算 (找回 ATR) ==================
+# ================== 3. 指标计算 ==================
 
 df_raw = get_historical_data()
 if not df_raw.empty:
@@ -63,15 +63,16 @@ if not df_raw.empty:
     if snap and snap['date'].date() not in df.index:
         df.loc[snap['date'].date()] = [snap['close']]*4 
     
-    # 1. 均线
+    # 1. 价格均线
     df['ma9'] = df['close'].rolling(9).mean()
     df['ma25'] = df['close'].rolling(25).mean()
     df['ma90'] = df['close'].rolling(90).mean()
     
-    # 2. ATR (找回此处逻辑)
+    # 2. ATR 计算 (将原来的 25 修改为 14)
     pc = df['close'].shift(1)
     tr = pd.concat([df['high']-df['low'], (df['high']-pc).abs(), (df['low']-pc).abs()], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(25).mean()
+    df['atr14'] = tr.rolling(14).mean()
+    df['atr40'] = tr.rolling(40).mean()
     
     # 3. HV60 分位
     log_ret = np.log(df['close'] / df['close'].shift(1))
@@ -82,24 +83,23 @@ if not df_raw.empty:
 
     # ================== 4. 界面渲染 ==================
     
-    st.title(f"📊 {SYMBOL_NAME}")
+    st.title(f"📊 {SYMBOL_NAME} ({SYMBOL_CODE})")
 
-    # 第一排指标卡
-    c1, c2, c3 = st.columns(3)
-    c1.metric("最新价", f"¥{latest['close']:.2f}")
-    c2.metric("HV60占比", f"{latest['hv_pctile']:.1%}")
-    c3.metric("ATR波幅", f"{latest['atr']:.2f}")
+    # 第一排：展示 ATR 40 和 新修改的 ATR 14
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ATR 40", f"{latest['atr40']:.2f}")
+    c2.metric("最新价", f"¥{latest['close']:.2f}")
+    c3.metric("ATR 14", f"{latest['atr14']:.2f}")
+    c4.metric("HV60占比", f"{latest['hv_pctile']:.1%}")
     
-    # 第二排均线卡
-    c4, c5, c6 = st.columns(3)
-    c4.metric("MA9(紫)", f"{latest['ma9']:.2f}")
-    c5.metric("MA25(黄)", f"{latest['ma25']:.2f}")
-    c6.metric("MA90(红)", f"{latest['ma90']:.2f}")
+    # 第二排：均线数值
+    c5, c6, c7 = st.columns(3)
+    c5.metric("MA9(紫)", f"{latest['ma9']:.2f}")
+    c6.metric("MA25(黄)", f"{latest['ma25']:.2f}")
+    c7.metric("MA90(红)", f"{latest['ma90']:.2f}")
 
-    # 趋势大图 (包含 ATR 副图)
     st.write("---")
     pdf = df.tail(120)
-    # 修改为 3 行，给 ATR 留出空间
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25])
     
     # Row 1: K线与均线
@@ -111,8 +111,9 @@ if not df_raw.empty:
     # Row 2: HV60分位
     fig.add_trace(go.Scatter(x=pdf.index, y=pdf['hv_pctile'], fill='tozeroy', line=dict(color='orange'), name="HV分位"), row=2, col=1)
     
-    # Row 3: ATR 曲线 (重新加回)
-    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['atr'], line=dict(color='blue', width=1.5), name="ATR"), row=3, col=1)
+    # Row 3: ATR 曲线 (展示 14 和 40)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['atr14'], line=dict(color='blue', width=1.5), name="ATR 14"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['atr40'], line=dict(color='#00CED1', width=1.5, dash='dot'), name="ATR 40"), row=3, col=1)
     
     fig.update_layout(
         height=750, 
@@ -124,12 +125,16 @@ if not df_raw.empty:
     )
     fig.update_xaxes(fixedrange=True)
     fig.update_yaxes(fixedrange=True)
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    
+    st.plotly_chart(fig, width="stretch", config={'displayModeBar': False})
 
     # 明细表
-    st.subheader("📋 数据明细")
-    table_df = df[['close', 'ma9', 'ma25', 'ma90', 'hv_pctile', 'atr']].tail(15).iloc[::-1]
-    st.dataframe(table_df.style.format({'hv_pctile': '{:.1%}', 'close': '{:.2f}', 'atr': '{:.2f}'}), use_container_width=True)
+    st.subheader("📋 指标明细表")
+    table_df = df[['close', 'ma9', 'ma25', 'ma90', 'hv_pctile', 'atr14', 'atr40']].tail(15).iloc[::-1]
+    st.dataframe(table_df.style.format({
+        'hv_pctile': '{:.1%}', 'close': '{:.2f}', 'ma9': '{:.2f}', 
+        'ma25': '{:.2f}', 'ma90': '{:.2f}', 'atr14': '{:.2f}', 'atr40': '{:.2f}'
+    }), width="stretch")
 
 else:
     st.error("数据加载失败。")
